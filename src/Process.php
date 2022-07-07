@@ -4,10 +4,13 @@ namespace Amp\Process;
 
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\WritableResourceStream;
+use Amp\ForbidCloning;
+use Amp\ForbidSerialization;
 use Amp\Process\Internal\Posix\PosixRunner as PosixProcessRunner;
 use Amp\Process\Internal\ProcessHandle;
 use Amp\Process\Internal\ProcessRunner;
 use Amp\Process\Internal\ProcessStatus;
+use Amp\Process\Internal\ProcessStreams;
 use Amp\Process\Internal\ProcHolder;
 use Amp\Process\Internal\Windows\WindowsRunner as WindowsProcessRunner;
 use JetBrains\PhpStorm\ArrayShape;
@@ -15,6 +18,9 @@ use Revolt\EventLoop;
 
 final class Process
 {
+    use ForbidCloning;
+    use ForbidSerialization;
+
     private static \WeakMap $driverRunner;
 
     private static \WeakMap $procHolder;
@@ -22,17 +28,18 @@ final class Process
     /**
      * Starts a new process.
      *
-     * @param string|string[] $command Command to run.
+     * @param string|list<string> $command Command to run.
      * @param string|null $workingDirectory Working directory, or an empty string to use the working directory of the
      *     parent.
-     * @param string[] $environment Environment variables, or use an empty array to inherit from the parent.
+     * @param array<string, string> $environment Environment variables, or use an empty array to inherit from the parent.
      * @param array $options Options for `proc_open()`.
      *
+     * @throws ProcessException If starting the process fails.
      * @throws \Error If the arguments are invalid.
      */
     public static function start(
         string|array $command,
-        string $workingDirectory = null,
+        ?string $workingDirectory = null,
         array $environment = [],
         array $options = []
     ): self {
@@ -47,7 +54,7 @@ final class Process
         }
 
         $command = \is_array($command)
-            ? \implode(" ", \array_map(__NAMESPACE__ . "\\escapeArgument", $command))
+            ? \implode(" ", \array_map(escapeArgument(...), $command))
             : $command;
 
         $driver = EventLoop::getDriver();
@@ -68,56 +75,39 @@ final class Process
         }
 
         $runner = self::$driverRunner[$driver];
-        $handle = $runner->start(
+        $context = $runner->start(
             $command,
             $workingDirectory,
             $envVars,
             $options
         );
 
+        $handle = $context->handle;
+        $streams = $context->streams;
+
         $procHolder = new ProcHolder($runner, $handle);
 
         /** @psalm-suppress RedundantPropertyInitializationCheck */
         self::$procHolder ??= new \WeakMap();
-        self::$procHolder[$handle->stdin] = $procHolder;
-        self::$procHolder[$handle->stdout] = $procHolder;
-        self::$procHolder[$handle->stderr] = $procHolder;
+        self::$procHolder[$streams->stdin] = $procHolder;
+        self::$procHolder[$streams->stdout] = $procHolder;
+        self::$procHolder[$streams->stderr] = $procHolder;
 
-        return new self($runner, $handle, $command, $workingDirectory, $envVars, $options);
+        return new self($runner, $handle, $streams, $command, $workingDirectory, $envVars, $options);
     }
 
-    private ProcessRunner $runner;
-
-    private ProcessHandle $handle;
-
-    private string $command;
-
-    private string $workingDirectory;
-
-    /** @var string[] */
-    private array $environment;
-
-    private array $options;
-
+    /**
+     * @param array<string, string> $environment
+     */
     private function __construct(
-        ProcessRunner $runner,
-        ProcessHandle $handle,
-        string $command,
-        string $workingDirectory,
-        array $environment = [],
-        array $options = []
+        private readonly ProcessRunner $runner,
+        private readonly ProcessHandle $handle,
+        private readonly ProcessStreams $streams,
+        private readonly string $command,
+        private readonly string $workingDirectory,
+        private readonly array $environment = [],
+        private readonly array $options = []
     ) {
-        $this->runner = $runner;
-        $this->handle = $handle;
-        $this->command = $command;
-        $this->workingDirectory = $workingDirectory;
-        $this->environment = $environment;
-        $this->options = $options;
-    }
-
-    public function __clone()
-    {
-        throw new \Error(self::class . " does not support cloning");
     }
 
     /**
@@ -164,8 +154,6 @@ final class Process
 
     /**
      * Returns the PID of the child process.
-     *
-     * @return int
      */
     public function getPid(): int
     {
@@ -214,12 +202,10 @@ final class Process
 
     /**
      * Determines if the process is still running.
-     *
-     * @return bool
      */
     public function isRunning(): bool
     {
-        return $this->handle->status !== ProcessStatus::ENDED;
+        return $this->handle->status !== ProcessStatus::Ended;
     }
 
     /**
@@ -227,7 +213,7 @@ final class Process
      */
     public function getStdin(): WritableResourceStream
     {
-        return $this->handle->stdin;
+        return $this->streams->stdin;
     }
 
     /**
@@ -235,7 +221,7 @@ final class Process
      */
     public function getStdout(): ReadableResourceStream
     {
-        return $this->handle->stdout;
+        return $this->streams->stdout;
     }
 
     /**
@@ -243,7 +229,7 @@ final class Process
      */
     public function getStderr(): ReadableResourceStream
     {
-        return $this->handle->stderr;
+        return $this->streams->stderr;
     }
 
     #[ArrayShape([

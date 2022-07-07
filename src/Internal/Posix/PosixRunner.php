@@ -4,15 +4,25 @@ namespace Amp\Process\Internal\Posix;
 
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\WritableResourceStream;
+use Amp\ForbidCloning;
+use Amp\ForbidSerialization;
+use Amp\Process\Internal\ProcessContext;
 use Amp\Process\Internal\ProcessHandle;
 use Amp\Process\Internal\ProcessRunner;
 use Amp\Process\Internal\ProcessStatus;
+use Amp\Process\Internal\ProcessStreams;
 use Amp\Process\ProcessException;
 use Revolt\EventLoop;
 
-/** @internal */
+/**
+ * @internal
+ * @implements ProcessRunner<PosixHandle>
+ */
 final class PosixRunner implements ProcessRunner
 {
+    use ForbidCloning;
+    use ForbidSerialization;
+
     private const FD_SPEC = [
         ["pipe", "r"], // stdin
         ["pipe", "w"], // stdout
@@ -22,7 +32,6 @@ final class PosixRunner implements ProcessRunner
 
     private const NULL_DESCRIPTOR = ["file", "/dev/null", "r"];
 
-    /** @var string|null */
     private static ?string $fdPath = null;
 
     public function start(
@@ -30,7 +39,7 @@ final class PosixRunner implements ProcessRunner
         string $workingDirectory = null,
         array $environment = [],
         array $options = []
-    ): ProcessHandle {
+    ): ProcessContext {
         if (!\extension_loaded('posix')) {
             throw new ProcessException('Missing ext-posix to run processes with PosixRunner');
         }
@@ -41,14 +50,21 @@ final class PosixRunner implements ProcessRunner
             $command
         );
 
-        $proc = @\proc_open(
-            $command,
-            $this->generateFds(),
-            $pipes,
-            $workingDirectory ?: null,
-            $environment ?: null,
-            $options
-        );
+        // Errors checked below, so suppressing all errors during call to proc_open() and $this->generateFds().
+        \set_error_handler(static fn () => true);
+
+        try {
+            $proc = \proc_open(
+                $command,
+                $this->generateFds(),
+                $pipes,
+                $workingDirectory,
+                $environment ?: null,
+                $options
+            );
+        } finally {
+            \restore_error_handler();
+        }
 
         if (!\is_resource($proc)) {
             $message = "Could not start process";
@@ -57,8 +73,6 @@ final class PosixRunner implements ProcessRunner
             }
             throw new ProcessException($message);
         }
-
-        $handle = new PosixHandle($proc);
 
         $extraDataPipe = $pipes[3];
         \stream_set_blocking($extraDataPipe, false);
@@ -72,42 +86,19 @@ final class PosixRunner implements ProcessRunner
 
         $suspension->suspend();
 
-        $pid = \rtrim(@\fgets($extraDataPipe));
+        $pid = \rtrim(\fgets($extraDataPipe));
         if (!$pid || !\is_numeric($pid)) {
             throw new ProcessException("Could not determine PID");
         }
 
-        $handle->status = ProcessStatus::RUNNING;
-        $handle->pid = (int) $pid;
+        $stdin = new WritableResourceStream($pipes[0]);
+        $stdout = new ReadableResourceStream($pipes[1]);
+        $stderr = new ReadableResourceStream($pipes[2]);
 
-        $handle->stdin = new WritableResourceStream($pipes[0]);
-        $handle->stdout = new ReadableResourceStream($pipes[1]);
-        $handle->stderr = new ReadableResourceStream($pipes[2]);
-
-        $handle->extraDataPipeCallbackId = EventLoop::onReadable(
-            $extraDataPipe,
-            static function (string $callbackId, $stream) use ($handle, $extraDataPipe) {
-                $handle->extraDataPipeCallbackId = null;
-                EventLoop::cancel($callbackId);
-
-                $handle->status = ProcessStatus::ENDED;
-
-                if (!\is_resource($stream) || \feof($stream)) {
-                    $handle->joinDeferred->error(new ProcessException("Process ended unexpectedly"));
-                } else {
-                    $handle->joinDeferred->complete((int) \rtrim(@\stream_get_contents($stream)));
-                }
-
-                // Don't call proc_close here or close output streams, as there might still be stream reads
-                $handle->stdin->close();
-
-                \fclose($extraDataPipe);
-            }
+        return new ProcessContext(
+            new PosixHandle($proc, (int) $pid, $stdin, $extraDataPipe),
+            new ProcessStreams($stdin, $stdout, $stderr),
         );
-
-        EventLoop::unreference($handle->extraDataPipeCallbackId);
-
-        return $handle;
     }
 
     private function generateFds(): array
@@ -116,7 +107,7 @@ final class PosixRunner implements ProcessRunner
             self::$fdPath = \file_exists("/dev/fd") ? "/dev/fd" : "/proc/self/fd";
         }
 
-        $fdList = @\scandir(self::$fdPath, \SCANDIR_SORT_NONE);
+        $fdList = \scandir(self::$fdPath, \SCANDIR_SORT_NONE);
 
         if ($fdList === false) {
             throw new ProcessException("Unable to list open file descriptors");
@@ -137,28 +128,29 @@ final class PosixRunner implements ProcessRunner
     public function join(ProcessHandle $handle): int
     {
         /** @var PosixHandle $handle */
-        if ($handle->extraDataPipeCallbackId !== null) {
-            EventLoop::reference($handle->extraDataPipeCallbackId);
-        }
+        $handle->reference();
 
         return $handle->joinDeferred->getFuture()->await();
     }
 
     public function kill(ProcessHandle $handle): void
     {
+        /** @var PosixHandle $handle */
+        $handle->reference();
+
         $this->signal($handle, 9);
     }
 
     public function signal(ProcessHandle $handle, int $signal): void
     {
         /** @noinspection PhpComposerExtensionStubsInspection */
-        @\posix_kill($handle->pid, $signal);
+        \posix_kill($handle->pid, $signal);
     }
 
     public function destroy(ProcessHandle $handle): void
     {
         /** @var PosixHandle $handle */
-        if ($handle->status < ProcessStatus::ENDED && \getmypid() === $handle->originalParentPid) {
+        if ($handle->status !== ProcessStatus::Ended && \getmypid() === $handle->originalParentPid) {
             try {
                 $this->kill($handle);
             } catch (ProcessException) {

@@ -2,17 +2,19 @@
 
 namespace Amp\Process\Internal;
 
+use Amp\ForbidCloning;
+use Amp\ForbidSerialization;
+
 /** @internal */
 final class ProcHolder
 {
-    private ProcessRunner $runner;
+    use ForbidCloning;
+    use ForbidSerialization;
 
-    private ProcessHandle $handle;
-
-    public function __construct(ProcessRunner $runner, ProcessHandle $handle)
-    {
-        $this->runner = $runner;
-        $this->handle = $handle;
+    public function __construct(
+        private readonly ProcessRunner $runner,
+        private readonly ProcessHandle $handle
+    ) {
     }
 
     public function __destruct()

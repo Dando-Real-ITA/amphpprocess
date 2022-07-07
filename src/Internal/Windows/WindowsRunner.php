@@ -2,6 +2,9 @@
 
 namespace Amp\Process\Internal\Windows;
 
+use Amp\ForbidCloning;
+use Amp\ForbidSerialization;
+use Amp\Process\Internal\ProcessContext;
 use Amp\Process\Internal\ProcessHandle;
 use Amp\Process\Internal\ProcessRunner;
 use Amp\Process\Internal\ProcessStatus;
@@ -10,10 +13,14 @@ use const Amp\Process\BIN_DIR;
 
 /**
  * @internal
+ * @implements ProcessRunner<WindowsHandle>
  * @codeCoverageIgnore Windows only.
  */
 final class WindowsRunner implements ProcessRunner
 {
+    use ForbidCloning;
+    use ForbidSerialization;
+
     private const FD_SPEC = [
         ["pipe", "r"], // stdin
         ["pipe", "w"], // stdout
@@ -39,7 +46,7 @@ final class WindowsRunner implements ProcessRunner
         string $workingDirectory = null,
         array $environment = [],
         array $options = []
-    ): ProcessHandle {
+    ): ProcessContext {
         if (\str_contains($command, "\0")) {
             throw new ProcessException("Can't execute commands that contain NUL bytes.");
         }
@@ -83,7 +90,7 @@ final class WindowsRunner implements ProcessRunner
         $handle->wrapperPid = $status['pid'];
 
         try {
-            $this->socketConnector->connectPipes($handle);
+            $streams = $this->socketConnector->connectPipes($handle);
         } catch (\Exception) {
             $running = \is_resource($proc) && \proc_get_status($proc)['running'];
 
@@ -98,7 +105,7 @@ final class WindowsRunner implements ProcessRunner
             throw new ProcessException(\trim($message ?: 'Process did not connect to server before timeout elapsed'));
         }
 
-        return $handle;
+        return new ProcessContext($handle, $streams);
     }
 
     public function join(ProcessHandle $handle): int
@@ -123,7 +130,7 @@ final class WindowsRunner implements ProcessRunner
     public function destroy(ProcessHandle $handle): void
     {
         /** @var WindowsHandle $handle */
-        if ($handle->status < ProcessStatus::ENDED && \getmypid() === $handle->originalParentPid) {
+        if ($handle->status !== ProcessStatus::Ended && \getmypid() === $handle->originalParentPid) {
             try {
                 $this->kill($handle);
             } catch (ProcessException) {
