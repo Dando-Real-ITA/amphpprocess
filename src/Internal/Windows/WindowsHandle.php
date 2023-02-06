@@ -1,9 +1,10 @@
-<?php
+<?php declare(strict_types=1);
 
 namespace Amp\Process\Internal\Windows;
 
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\Process\Internal\ProcessHandle;
+use Amp\Sync\Barrier;
 
 /**
  * @internal

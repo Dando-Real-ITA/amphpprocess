@@ -1,4 +1,4 @@
-<?php
+<?php declare(strict_types=1);
 
 namespace Amp\Process\Internal\Windows;
 
@@ -16,6 +16,7 @@ use const Amp\Process\BIN_DIR;
  * @internal
  * @implements ProcessRunner<WindowsHandle>
  * @codeCoverageIgnore Windows only.
+ * @psalm-suppress UndefinedConstant Psalm 5.4 may have a bug with conditionally defined constants.
  */
 final class WindowsRunner implements ProcessRunner
 {
@@ -44,6 +45,7 @@ final class WindowsRunner implements ProcessRunner
 
     public function start(
         string $command,
+        Cancellation $cancellation,
         string $workingDirectory = null,
         array $environment = [],
         array $options = []
@@ -54,21 +56,25 @@ final class WindowsRunner implements ProcessRunner
 
         $options['bypass_shell'] = true;
 
-        $proc = @\proc_open(
-            $this->makeCommand($workingDirectory ?? ''),
-            self::FD_SPEC,
-            $pipes,
-            $workingDirectory ?: null,
-            $environment ?: null,
-            $options
-        );
+        \set_error_handler(static function (int $code, string $message): never {
+            throw new ProcessException("Process could not be started: Errno: {$code}; {$message}");
+        });
+
+        try {
+            $proc = \proc_open(
+                $this->makeCommand($workingDirectory ?? ''),
+                self::FD_SPEC,
+                $pipes,
+                $workingDirectory ?: null,
+                $environment ?: null,
+                $options
+            );
+        } finally {
+            \restore_error_handler();
+        }
 
         if (!\is_resource($proc)) {
-            $message = "Could not start process";
-            if ($error = \error_get_last()) {
-                $message .= \sprintf(" Errno: %d; %s", $error["type"], $error["message"]);
-            }
-            throw new ProcessException($message);
+            throw new ProcessException("Process could not be started: unknown error");
         }
 
         $status = \proc_get_status($proc);
@@ -82,6 +88,7 @@ final class WindowsRunner implements ProcessRunner
 
         if ($written !== SocketConnector::SECURITY_TOKEN_SIZE * 6 + \strlen($command) + 2) {
             \fclose($pipes[2]);
+            \proc_terminate($proc);
             \proc_close($proc);
 
             throw new ProcessException("Could not send security tokens / command to process wrapper");
@@ -91,7 +98,7 @@ final class WindowsRunner implements ProcessRunner
         $handle->wrapperPid = $status['pid'];
 
         try {
-            $streams = $this->socketConnector->connectPipes($handle);
+            $streams = $this->socketConnector->connectPipes($handle, $cancellation);
         } catch (\Exception) {
             $running = \is_resource($proc) && \proc_get_status($proc)['running'];
 
@@ -101,7 +108,10 @@ final class WindowsRunner implements ProcessRunner
             }
 
             \fclose($pipes[2]);
+            \proc_terminate($proc);
             \proc_close($proc);
+
+            $cancellation->throwIfRequested();
 
             throw new ProcessException(\trim($message ?: 'Process did not connect to server before timeout elapsed'));
         }

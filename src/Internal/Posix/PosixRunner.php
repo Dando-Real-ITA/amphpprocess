@@ -1,10 +1,11 @@
-<?php
+<?php declare(strict_types=1);
 
 namespace Amp\Process\Internal\Posix;
 
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\WritableResourceStream;
 use Amp\Cancellation;
+use Amp\CancelledException;
 use Amp\ForbidCloning;
 use Amp\ForbidSerialization;
 use Amp\Process\Internal\ProcessContext;
@@ -30,16 +31,16 @@ final class PosixRunner implements ProcessRunner
         ["pipe", "w"], // stderr
         ["pipe", "w"], // exit code pipe
     ];
-
     private const NULL_DESCRIPTOR = ["file", "/dev/null", "r"];
 
     private static ?string $fdPath = null;
 
     public function start(
         string $command,
+        Cancellation $cancellation,
         string $workingDirectory = null,
         array $environment = [],
-        array $options = []
+        array $options = [],
     ): ProcessContext {
         if (!\extension_loaded('posix')) {
             throw new ProcessException('Missing ext-posix to run processes with PosixRunner');
@@ -51,8 +52,9 @@ final class PosixRunner implements ProcessRunner
             $command
         );
 
-        // Errors checked below, so suppressing all errors during call to proc_open() and $this->generateFds().
-        \set_error_handler(static fn () => true);
+        \set_error_handler(static function (int $code, string $message): never {
+            throw new ProcessException("Process could not be started: Errno: {$code}; {$message}");
+        });
 
         try {
             $proc = \proc_open(
@@ -61,35 +63,57 @@ final class PosixRunner implements ProcessRunner
                 $pipes,
                 $workingDirectory,
                 $environment ?: null,
-                $options
+                $options,
             );
         } finally {
             \restore_error_handler();
         }
 
         if (!\is_resource($proc)) {
-            $message = "Could not start process";
-            if ($error = \error_get_last()) {
-                $message .= \sprintf(" Errno: %d; %s", $error["type"], $error["message"]);
-            }
-            throw new ProcessException($message);
+            throw new ProcessException("Process could not be started: unknown error");
         }
 
         $extraDataPipe = $pipes[3];
+
+        /** @psalm-suppress TypeDoesNotContainType */
+        if (!\is_resource($extraDataPipe)) {
+            throw new ProcessException("Process could not be started: the data pipe closed unexpectedly");
+        }
+
         \stream_set_blocking($extraDataPipe, false);
 
         $suspension = EventLoop::getSuspension();
-        EventLoop::onReadable($extraDataPipe, static function (string $callbackId) use ($suspension): void {
-            EventLoop::cancel($callbackId);
 
-            $suspension->resume();
-        });
+        $callbackId = EventLoop::onReadable(
+            $extraDataPipe,
+            static function (string $callbackId) use ($suspension): void {
+                EventLoop::cancel($callbackId);
+                $suspension->resume();
+            },
+        );
 
-        $suspension->suspend();
+        $cancellationId = $cancellation->subscribe(
+            static function (CancelledException $e) use ($suspension, $callbackId): void {
+                EventLoop::cancel($callbackId);
+                $suspension->throw($e);
+            },
+        );
 
-        $pid = \rtrim(\fgets($extraDataPipe));
+        try {
+            $suspension->suspend();
+        } catch (\Throwable $exception) {
+            \proc_terminate($proc);
+            \proc_close($proc);
+            throw $exception;
+        } finally {
+            $cancellation->unsubscribe($cancellationId);
+        }
+
+        $pid = \rtrim(\fgets($extraDataPipe) ?: '');
         if (!$pid || !\is_numeric($pid)) {
-            throw new ProcessException("Could not determine PID");
+            \proc_terminate($proc);
+            \proc_close($proc);
+            throw new ProcessException("Process could not be started: could not determine PID");
         }
 
         $stdin = new WritableResourceStream($pipes[0]);
