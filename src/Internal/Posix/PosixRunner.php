@@ -38,7 +38,7 @@ final class PosixRunner implements ProcessRunner
     public function start(
         string $command,
         Cancellation $cancellation,
-        string $workingDirectory = null,
+        ?string $workingDirectory = null,
         array $environment = [],
         array $options = [],
     ): ProcessContext {
@@ -109,6 +109,7 @@ final class PosixRunner implements ProcessRunner
             $cancellation->unsubscribe($cancellationId);
         }
 
+        /** @psalm-suppress RiskyTruthyFalsyComparison */
         $pid = \rtrim(\fgets($extraDataPipe) ?: '');
         if (!$pid || !\is_numeric($pid)) {
             \proc_terminate($proc);
