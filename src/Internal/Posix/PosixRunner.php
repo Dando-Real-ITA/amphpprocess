@@ -22,6 +22,8 @@ use Revolt\EventLoop;
  */
 final class PosixRunner implements ProcessRunner
 {
+    private const ESRCH = 3;
+
     use ForbidCloning;
     use ForbidSerialization;
 
@@ -35,6 +37,7 @@ final class PosixRunner implements ProcessRunner
 
     private static ?string $fdPath = null;
 
+    #[\Override]
     public function start(
         string $command,
         Cancellation $cancellation,
@@ -48,7 +51,7 @@ final class PosixRunner implements ProcessRunner
 
         $command = \sprintf(
             '{ (%s) <&3 3<&- 3>/dev/null & } 3<&0; trap "" INT TERM QUIT HUP;' .
-            'pid=$!; echo $pid >&3; wait $pid; RC=$?; echo $RC >&3; exit $RC',
+            'pid=$!; echo $pid >&3; wait $pid 2>/dev/null; RC=$?; echo $RC >&3; exit $RC',
             $command
         );
 
@@ -154,9 +157,9 @@ final class PosixRunner implements ProcessRunner
         return self::FD_SPEC + $fds;
     }
 
+    #[\Override]
     public function join(ProcessHandle $handle, ?Cancellation $cancellation = null): int
     {
-        /** @var PosixHandle $handle */
         $handle->reference();
 
         try {
@@ -166,23 +169,44 @@ final class PosixRunner implements ProcessRunner
         }
     }
 
+    #[\Override]
     public function kill(ProcessHandle $handle): void
     {
-        /** @var PosixHandle $handle */
         $handle->reference();
 
         $this->signal($handle, 9);
+
+        $handle->reapShell();
     }
 
+    #[\Override]
     public function signal(ProcessHandle $handle, int $signal): void
     {
         /** @noinspection PhpComposerExtensionStubsInspection */
-        \posix_kill($handle->pid, $signal);
+        if (\posix_kill($handle->pid, $signal)) {
+            return;
+        }
+
+        $error = \posix_get_last_error();
+        if ($error === (\defined('PCNTL_ESRCH') ? \PCNTL_ESRCH : self::ESRCH)) {
+            return;
+        }
+
+        throw new ProcessException(
+            \sprintf(
+                "Failed to send signal %d to process %d: Errno: %d; %s",
+                $signal,
+                $handle->pid,
+                $error,
+                \posix_strerror($error),
+            ),
+            $error,
+        );
     }
 
+    #[\Override]
     public function destroy(ProcessHandle $handle): void
     {
-        /** @var PosixHandle $handle */
         if ($handle->status !== ProcessStatus::Ended && \getmypid() === $handle->originalParentPid) {
             try {
                 $this->kill($handle);

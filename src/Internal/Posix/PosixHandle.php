@@ -37,7 +37,7 @@ final class PosixHandle extends ProcessHandle
         $stdin = \WeakReference::create($stdin);
         $this->extraDataPipeCallbackId = EventLoop::unreference(EventLoop::onReadable(
             $extraDataPipe,
-            static function (string $callbackId, $stream) use (&$status, $deferred, $stdin, $shellPid): void {
+            static function (string $callbackId, $stream) use (&$status, $deferred, $stdin, $proc, $shellPid): void {
                 EventLoop::disable($callbackId);
 
                 $status = ProcessStatus::Ended;
@@ -45,17 +45,14 @@ final class PosixHandle extends ProcessHandle
                 if (!\is_resource($stream) || \feof($stream)) {
                     $deferred->error(new ProcessException("Process ended unexpectedly"));
                 } else {
+                    /** @psalm-suppress PossiblyFalseArgument */
                     $deferred->complete((int) \rtrim(\stream_get_contents($stream)));
                 }
 
                 // Don't call proc_close here or close output streams, as there might still be stream reads
                 $stdin->get()?->close();
 
-                if (\is_resource($stream)) {
-                    \fclose($stream);
-                }
-
-                self::asyncWaitPid($shellPid);
+                self::asyncWaitPid($proc, $shellPid);
             },
         ));
     }
@@ -74,18 +71,28 @@ final class PosixHandle extends ProcessHandle
         }
     }
 
-    private static function asyncWaitPid(int $pid): void
+    /** @param resource $proc */
+    private static function asyncWaitPid($proc, int $pid): void
     {
-        if (self::hasChildExited($pid)) {
+        if (self::hasChildExited($proc, $pid)) {
             return;
         }
 
-        EventLoop::unreference(EventLoop::defer(static fn () => self::asyncWaitPid($pid)));
+        EventLoop::unreference(EventLoop::defer(static fn () => self::asyncWaitPid($proc, $pid)));
     }
 
-    private static function hasChildExited(int $pid): bool
+    /** @param resource $proc */
+    private static function hasChildExited($proc, int $pid): bool
     {
-        return !\extension_loaded('pcntl') || \pcntl_waitpid($pid, $status, \WNOHANG) !== 0;
+        if (!\function_exists('pcntl_waitpid')) {
+            return !\proc_get_status($proc)['running'];
+        }
+
+        do {
+            $result = \pcntl_waitpid($pid, $status, \WNOHANG);
+        } while ($result === -1 && \pcntl_get_last_error() === \PCNTL_EINTR);
+
+        return $result !== 0;
     }
 
     public function __destruct()
@@ -95,17 +102,33 @@ final class PosixHandle extends ProcessHandle
             $this->extraDataPipeCallbackId = null;
         }
 
-        if ($this->joinDeferred->isComplete()) {
+        if ($this->status === ProcessStatus::Ended) {
+            $this->reapShell();
             return;
         }
 
-        self::asyncWaitPid($this->shellPid);
+        self::asyncWaitPid($this->proc, $this->shellPid);
     }
 
+    public function reapShell(): void
+    {
+        if (\function_exists('pcntl_waitpid')) {
+            do {
+                $result = \pcntl_waitpid($this->shellPid, $status);
+            } while ($result === -1 && \pcntl_get_last_error() === \PCNTL_EINTR);
+
+            return;
+        }
+
+        while (\proc_get_status($this->proc)['running']) {
+            \usleep(1_000);
+        }
+    }
+
+    #[\Override]
     public function wait(): void
     {
-        if (\extension_loaded('pcntl')) {
-            \pcntl_waitpid($this->pid, $status);
-        }
+        // Do not block the shutdown handler before ProcHolder destruction terminates the process.
+        self::hasChildExited($this->proc, $this->shellPid);
     }
 }
